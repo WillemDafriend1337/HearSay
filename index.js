@@ -153,16 +153,8 @@ function updateWitAIAppLang(appID, lang, cb) {
 
 
 const Discord = require('discord.js')
-const DiscoidVoice = require('@discordjs/voice')
 const DISCORD_MSG_LIMIT = 2000;
-const discordClient = new Discord.Client({
-  intents: [
-    Discord.Intents.FLAGS.GUILDS,
-    Discord.Intents.FLAGS.GUILD_MESSAGES,
-    Discord.Intents.FLAGS.GUILD_MEMBERS,
-    Discord.Intents.FLAGS.GUILD_VOICE_STATES
-  ],
-});
+const discordClient = new Discord.Client()
 if (process.env.DEBUG)
     discordClient.on('debug', console.debug);
 discordClient.on('ready', () => {
@@ -181,12 +173,12 @@ const _CMD_LANG        = PREFIX + 'lang';
 const guildMap = new Map();
 
 
-discordClient.on('messageCreate', async (msg) => {
+discordClient.on('message', async (msg) => {
     try {
         if (!('guild' in msg) || !msg.guild) return; // prevent private messages to bot
         const mapKey = msg.guild.id;
         if (msg.content.trim().toLowerCase() == _CMD_JOIN) {
-            if (!msg.member.voice.channelId) {
+            if (!msg.member.voice.channelID) {
                 msg.reply('Error: please join a voice channel first.')
             } else {
                 if (!guildMap.has(mapKey))
@@ -197,7 +189,8 @@ discordClient.on('messageCreate', async (msg) => {
         } else if (msg.content.trim().toLowerCase() == _CMD_LEAVE) {
             if (guildMap.has(mapKey)) {
                 let val = guildMap.get(mapKey);
-                if (val.voice_Connection) val.voice_Connection.destroy()
+                if (val.voice_Channel) val.voice_Channel.leave()
+                if (val.voice_Connection) val.voice_Connection.disconnect()
                 guildMap.delete(mapKey)
                 msg.reply("Disconnected.")
             } else {
@@ -267,23 +260,21 @@ class Silence extends Readable {
 
 async function connect(msg, mapKey) {
     try {
+        let voice_Channel = await discordClient.channels.fetch(msg.member.voice.channelID);
+        if (!voice_Channel) return msg.reply("Error: The voice channel does not exist!");
         let text_Channel = await discordClient.channels.fetch(msg.channel.id);
         if (!text_Channel) return msg.reply("Error: The text channel does not exist!");
-        let voice_Connection = DiscoidVoice.joinVoiceChannel({
-          adapterCreator: msg.guild.voiceAdapterCreator,
-          channelId: msg.member.voice.channelId,
-          guildId: msg.guild.id,
-          selfDeaf: false,
-        });
-        await DiscoidVoice.entersState(voice_Connection, DiscoidVoice.VoiceConnectionStatus.Ready, 20e3);
+        let voice_Connection = await voice_Channel.join();
+        voice_Connection.play(new Silence(), { type: 'opus' });
         guildMap.set(mapKey, {
             'text_Channel': text_Channel,
+            'voice_Channel': voice_Channel,
             'voice_Connection': voice_Connection,
             'selected_lang': 'en',
             'debug': false,
         });
-        speak_impl(voice_Connection.receiver, mapKey)
-        voice_Connection.on(DiscoidVoice.VoiceConnectionStatus.Disconnected, async(e) => {
+        speak_impl(voice_Connection, mapKey)
+        voice_Connection.on('disconnect', async(e) => {
             if (e) console.log(e);
             guildMap.delete(mapKey);
         })
@@ -309,31 +300,23 @@ if (SPEECH_METHOD === 'vosk') {
   // dev reference: https://github.com/alphacep/vosk-api/blob/master/nodejs/index.js
 }
 
-const prism = require('prism-media');
-function speak_impl(receiver, mapKey) {
-    receiver.speaking.on('start', async (userId) => {
-      let user = await discordClient.users.fetch(userId);
-        if (user.bot) {
+
+function speak_impl(voice_Connection, mapKey) {
+    voice_Connection.on('speaking', async (user, speaking) => {
+        if (speaking.bitfield == 0 || user.bot) {
             return
         }
         console.log(`I'm listening to ${user.username}`)
         // this creates a 16-bit signed PCM, stereo 48KHz stream
-        const audioStream = receiver.subscribe(userId, {
-          end: {
-            behavior: DiscoidVoice.EndBehaviorType.AfterSilence,
-            duration: 100,
-          },
-        });
-        const decodedAudioStream = new prism.opus.Decoder({ channels: 2, rate: 48000, frameSize: 960 });
-        audioStream.pipe(decodedAudioStream);
-        decodedAudioStream.on('error',  (e) => { 
+        const audioStream = voice_Connection.receiver.createStream(user, { mode: 'pcm' })
+        audioStream.on('error',  (e) => { 
             console.log('audioStream: ' + e)
         });
         let buffer = [];
-        decodedAudioStream.on('data', (data) => {
+        audioStream.on('data', (data) => {
             buffer.push(data)
         })
-        decodedAudioStream.on('end', async () => {
+        audioStream.on('end', async () => {
             buffer = Buffer.concat(buffer)
             const duration = buffer.length / 48000 / 4;
             console.log("duration: " + duration)
@@ -391,10 +374,14 @@ async function transcribe_witai(buffer) {
     try {
         // ensure we do not send more than one request per second
         if (witAI_lastcallTS != null) {
-            let now = Math.floor(new Date());    
+            let now = Math.floor(new Date());
             while (now - witAI_lastcallTS < 1000) {
                 console.log('sleep')
-                await sleep(100);
+                if (now - witAI_lastcallTS > 100) {
+                    await sleep(now - witAI_lastcallTS - 99);
+                } else {
+                    await sleep(100);
+                }
                 now = Math.floor(new Date());
             }
         }
@@ -406,17 +393,65 @@ async function transcribe_witai(buffer) {
         console.log('transcribe_witai')
         const extractSpeechIntent = util.promisify(witClient.extractSpeechIntent);
         var stream = Readable.from(buffer);
-        const contenttype = "audio/raw;encoding=signed-integer;bits=16;rate=48k;endian=little"
-        const output = await extractSpeechIntent(WITAI_TOK, stream, contenttype)
+        const contenttype = "audio/raw;encoding=signed-integer;bits=16;rate=48k;endian=little";
+        const multijson = await extractSpeechIntent(WITAI_TOK, stream, contenttype);
+
+        const output = parseMultijson(multijson);
         witAI_lastcallTS = Math.floor(new Date());
-        console.log(output)
-        stream.destroy()
+        console.log(output);
+        stream.destroy();
         if (output && '_text' in output && output._text.length)
-            return output._text
+            return output._text;
         if (output && 'text' in output && output.text.length)
             return output.text
         return output;
     } catch (e) { console.log('transcribe_witai 851:' + e); console.log(e) }
+}
+
+function parseMultijson(multijson) {
+    if (typeof(multijson) !== 'string') {
+        return multijson; // Assume is already parsed as JSON
+    }
+    let isEscaped = false;
+    let lastRootBracket = 0;
+    let inString = false;
+    let bracketDepth = 0;
+    let char;
+    for (let i = 0; i < multijson.length; i++) {
+        if (isEscaped) {
+            isEscaped = false;
+            continue;
+        }
+        char = multijson.charAt(i);
+
+        if (char === "\\") {
+            if (inString) {
+                isEscaped = true;
+            } else {
+                throw "Invalid json: backslash outside string"
+            }
+        } else if (char === "\"") {
+            inString = !inString;
+        } else if (!inString) { 
+            if (char === "{") {
+                if (bracketDepth === 0) {
+                    lastRootBracket = i;
+                }
+                bracketDepth += 1;
+            } else if (char === "}") {
+                bracketDepth -= 1;
+                if (bracketDepth < 0) {
+                    throw "Invalid JSON: unbalanced brackets"
+                }
+            }
+        }
+    }
+
+    if (bracketDepth !== 0) {
+        throw "Invalid JSON: unbalanced brackets"
+    }
+    
+    return JSON.parse(multijson.substring(lastRootBracket));
 }
 
 // Google Speech API
@@ -457,4 +492,3 @@ async function transcribe_gspeech(buffer) {
 //////////////////////////////////////////
 //////////////////////////////////////////
 //////////////////////////////////////////
-
